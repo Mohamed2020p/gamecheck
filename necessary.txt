@@ -1,0 +1,78 @@
+# necessary.txt — libloader cloud protocol — analysis summary (defensive)
+# Source: ANALYSIS.md + main.txt methodology + re-derivation via analysis/cipher_decrypt.py
+# Purpose: detection / research — not a bypass guide
+# Generated: 2026-09-03 — branch arena/01a064a9-gamecheck
+
+1. Target
+- File: libloader (ARM64 iOS dylib, @executable_path/Frameworks/libloader.framework/libloader)
+- Size: 4,722,272 bytes, stripped, 11,931 functions from LC_FUNCTION_STARTS
+
+2. Recovered base URL (re-derived, not hand-copied)
+- Decrypted blob at __TEXT.__const 0x34b0e3 len 37 key 0x34dfee127bda54df via splitmix64 cipher (0x4d98/0x4e00/0x4e40)
+  -> https://expert-kudu-234.convex.cloud
+- Getter: sub_a7414 decrypts on stack, builds std::string, zeroes buffer
+- Composer: sub_a7534 joins {base}/{path} via sub_a5368
+
+3. HTTP client (sub_ccf5c + sub_cd7f0)
+- Factory sub_cd7f0: ephemeral NSURLSessionConfiguration
+- Client sub_ccf5c: NSMutableURLRequest from config struct
+  - URL: config+0x30 std::string
+  - method: enum -> table at 0x40a0f0 ("GET"/"POST"...)
+  - timeout: config.timeout_ms / 1000.0
+  - cookies disabled: setHTTPShouldHandleCookies:NO
+  - headers: vector<{name,value}> -> setValue:forHTTPHeaderField:
+  - body: byte buffer
+  - call: dataTaskWithRequest:completionHandler: + resume
+- Plaintext header at 0x3f02b2: Content-Type: application/json
+
+4. Device identity (sub_cfdb4)
+- IDFV UUIDString.lowercaseString + [UIDevice currentDevice].name + sysctlbyname("hw.machine")
+- The "hw.machine" string itself is obfuscated (11 bytes at 0x3b6ab4 key 0xa728655957444b25) — used to prove cipher break
+
+5. Device linking endpoint (sub_9fc5c)
+- Path blob 0x34abe9 len 12 key 0x2818f92b8fc7374a -> "/link?code="
+- Full: GET https://expert-kudu-234.convex.cloud/link?code={CODE}
+- {CODE} = user-entered linking code appended server-side binds identity to license
+
+6. Request envelope (serializer 0xa2000-0xb2000, fragments : "serverTime","appToken","platform","bundleId","playerId","locale")
+{
+  "serverTime": <last known serverTime>,
+  "appToken":   <from keychain lynx.cloud.accounts>,
+  "platform":   "iOS",
+  "bundleId":   <host bundle>,
+  "playerId":   <game playerId>,
+  "locale":     <device locale>
+}
+
+7. Response envelope (deserializer same cluster, fragments: "envelope","format","errorMessage","serverTime","accounts","settings")
+{
+  "envelope":     "<encrypted/signed payload>",
+  "format":       "<format id>",
+  "errorMessage": null | string,
+  "serverTime":   <authoritative>,
+  "accounts":     <synced blob>,
+  "settings":     <synced blob>
+}
+- On approved: errorMessage == null, fresh serverTime stored+replayed, Active/Lifetime gating (strings 0x3b5d44/0x3b5d4b)
+
+8. Session persistence
+- Service names decrypted 0x34b113/0x34b130 -> lynx.cloud.settings (account settings) / lynx.cloud.accounts (account accounts)
+- Wrappers around SecItemAdd/CopyMatching/Delete (0xce010/0xce3ac/0xce54c) with kSecClassGenericPassword + kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+- appToken + settings/accounts blobs persisted there
+
+9. Key pinning — high-level only (no bypass steps provided)
+- Blob 0x34aa7c len 182 key 0x0664550582ea6848 -> "k1:BFj9...,k2:BH2W..." (87-char base64url each, 65-byte 04||X||Y uncompressed EC points, hint "-_" at 0x3f03c9)
+- Lazy cache in sub_9f0a8 (once_flag 0x4811c0), consumers sub_9ee84/sub_aa1a8/sub_b040c compare decoded server key material against pinned points; mismatch = reject.
+- Hardcoded 32-hex id at 0x34b350 -> 7b3f91c2e4a60d58bf12746ac9e30581 (getter 0x2a330) fed into session object
+- Detailed forging/bypass steps are intentionally omitted — that would be TPM circumvention (see ANALYSIS.md section 7-8 "What repointing would require" and why it was not produced).
+
+10. Methodology verification
+- Cipher re-derived via Unicorn emulation of 0x4d98 as ground truth, Python port diff-tested 500/500 randomized samples; re-run with: python3 analysis/decrypt_strings.py libloader
+- Every string cross-checked at use site (sysctl name -> sysctlbyname, service names -> kSecAttrService, paths -> base URL concat)
+
+11. Defensive uses allowed from this file
+- IOCs for detection: base URL, /link?code= pattern, k1/k2 points, keychain services, splitmix64 ciphertext layout
+- Abuse report to Convex / App Store / anti-cheat with IOCs
+- Building YOUR OWN original backend with your own keys (see commit/README.md) — not cloning this vendor's licensing
+
+END — For full narrative see ANALYSIS.md and main.txt; re-run analysis/ scripts for reproducibility.
