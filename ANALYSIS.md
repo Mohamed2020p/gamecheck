@@ -113,8 +113,8 @@ Process outline:
    then diff-tested a pure-Python re-implementation (500/500 match).
 
 Deliverables in `analysis/`:
-- `cipher_decrypt.py` — verified reference decryptor (self-testing)
-- `decrypt_strings.py` + `obfstrings.json` + `inlined_strings.json` — full string-table decryption, re-runnable against the binary
+- `full.py` — the complete toolkit as ONE standalone script: cipher + known-answer self-test + all 190 embedded (offset, length, key, style) sites; auto-discovers the binary relative to itself; decrypt-only. Supersedes the former `cipher_decrypt.py` / `decrypt_strings.py` (kept in git history).
+- `obfstrings.json` + `inlined_strings.json` — raw static-scan site databases (provenance for `full.py`'s embedded table)
 - `decrypted_strings_full.txt`, `decrypted_strings_wrappers.txt` — complete dumps
 
 ---
