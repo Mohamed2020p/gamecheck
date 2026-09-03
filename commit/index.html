@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Lynx API — Protocol Reference (Educational)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { poppins: ['Poppins','sans-serif'] },
+          colors: {
+            ink: '#0f172a',
+            muted: '#64748b',
+            accent: '#6366f1',
+            accent2: '#06b6d4',
+            card: '#ffffff',
+            bg: '#f8fafc'
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    *{font-family: 'Poppins', sans-serif}
+    pre::-webkit-scrollbar{height:6px;width:6px}
+  </style>
+</head>
+<body class="bg-bg text-ink antialiased">
+  <!-- Header -->
+  <header class="sticky top-0 z-30 bg-white/80 backdrop-blur border-b border-slate-200">
+    <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent to-accent2 grid place-items-center text-white font-bold">Lx</div>
+        <div>
+          <div class="font-semibold leading-none">Lynx Protocol Reference</div>
+          <div class="text-xs text-muted -mt-0.5">Educational API documentation — not a clone backend</div>
+        </div>
+      </div>
+      <span class="hidden md:inline-flex items-center gap-2 text-xs px-3 py-1.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">● Read-only analysis</span>
+    </div>
+  </header>
+
+  <!-- Hero -->
+  <section class="max-w-6xl mx-auto px-6 pt-10 pb-6">
+    <div class="grid lg:grid-cols-[1.25fr_0.85fr] gap-6">
+      <div class="bg-white rounded-2xl border border-slate-200 p-7 shadow-sm">
+        <p class="text-xs tracking-widest font-semibold text-accent uppercase">Analysis • libloader (ARM64 iOS dylib)</p>
+        <h1 class="text-3xl font-semibold leading-tight mt-2">How the licensing & cloud layer <span class="bg-gradient-to-r from-accent to-accent2 bg-clip-text text-transparent">actually communicates</span></h1>
+        <p class="text-sm text-muted mt-3 leading-relaxed">
+          This page documents the request/response shapes recovered by static analysis (splitmix64 cipher, xref DB, stub resolution). It is intended for <b>defensive research and detection</b> — not for impersonating the vendor backend or bypassing its license checks.
+        </p>
+        <div class="flex flex-wrap gap-2 mt-5">
+          <span class="text-xs px-3 py-1.5 rounded-full bg-slate-900 text-white">Base URL recovered</span>
+          <span class="text-xs px-3 py-1.5 rounded-full bg-white border border-slate-200">Convex deployment</span>
+          <span class="text-xs px-3 py-1.5 rounded-full bg-white border border-slate-200">NSURLSession • ephemeral</span>
+        </div>
+        <div class="mt-6 rounded-xl bg-slate-900 text-slate-100 p-4 flex items-center justify-between gap-4">
+          <code class="text-sm break-all">https://expert-kudu-234.convex.cloud</code>
+          <span class="text-[11px] px-2 py-1 rounded bg-white/10 border border-white/10 whitespace-nowrap">GET / POST • application/json</span>
+        </div>
+        <p class="text-xs text-muted mt-2">Recovered from <code>0x34b0e3</code> (37 bytes, key <code>0x34dfee127bda54df</code>) via <code>analysis/cipher_decrypt.py</code> + <code>decrypt_strings.py</code>. Cookies disabled, timeout from <code>config.timeout_ms</code>.</p>
+      </div>
+
+      <div class="bg-gradient-to-br from-slate-900 to-slate-800 rounded-2xl p-7 text-white shadow-sm flex flex-col">
+        <h3 class="font-semibold">What you can build legitimately</h3>
+        <p class="text-sm text-white/70 mt-2">If you want your *own* game/tool with similar features, build your own backend with proper auth, key management, and user consent — don't clone a cheat's licensing server to enable cheating in 8 Ball Pool.</p>
+        <ul class="text-sm text-white/90 mt-4 space-y-2 list-disc list-inside marker:text-cyan-300">
+          <li>Your own API with <code>serverTime</code> sync & token auth</li>
+          <li>Keychain / secure storage for session tokens</li>
+          <li>Key pinning with your own rotated public keys</li>
+          <li>Clear ToS and anti-cheat compliance</li>
+        </ul>
+        <div class="mt-auto pt-6">
+          <div class="rounded-xl bg-white/10 border border-white/10 p-4">
+            <div class="text-xs text-white/60 uppercase tracking-widest font-semibold">Ethics note</div>
+            <p class="text-sm mt-1">The vendor pins two EC public keys (<code>k1/k2</code>) and validates <code>appToken</code> server-side. Forging an “approved” response to bypass that is a TPM circumvention and enables cheating — that part is not provided here.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Endpoints -->
+  <section class="max-w-6xl mx-auto px-6 py-6 grid lg:grid-cols-3 gap-6">
+    <div class="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+      <h2 class="font-semibold text-lg">Endpoints (recovered)</h2>
+      <div class="mt-4 space-y-4">
+        <div class="rounded-xl border border-slate-200 overflow-hidden">
+          <div class="px-4 py-3 bg-slate-50 flex items-center justify-between">
+            <span class="text-xs font-semibold tracking-widest uppercase text-muted">Device linking</span>
+            <span class="text-xs px-2 py-1 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">GET</span>
+          </div>
+          <div class="px-4 py-4">
+            <code class="text-sm break-all">/link?code={CODE}</code>
+            <p class="text-xs text-muted mt-1">Built in <code>sub_9fc5c</code> as <code>base + "/link?code=" + userCode</code> (blob <code>0x34abe9</code>). Binds <code>IDFV + device name + hw.machine</code> to license server-side.</p>
+            <div class="mt-3 flex gap-2 flex-wrap text-xs">
+              <span class="px-2.5 py-1 rounded-full bg-slate-900 text-white">Full URL: {base}/link?code=…</span>
+              <span class="px-2.5 py-1 rounded-full border border-slate-200">NSURLRequest • resume</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rounded-xl border border-slate-200 overflow-hidden">
+          <div class="px-4 py-3 bg-slate-50 flex items-center justify-between">
+            <span class="text-xs font-semibold tracking-widest uppercase text-muted">Session / cloud functions</span>
+            <span class="text-xs px-2 py-1 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">POST</span>
+          </div>
+          <div class="px-4 py-4">
+            <code class="text-sm break-all">{base}/{path} — application/json</code>
+            <p class="text-xs text-muted mt-1">Composed in <code>sub_a7534</code> via <code>sub_a5368</code> join. Uses ephemeral <code>NSURLSession</code> (<code>sub_cd7f0</code>), <code>Content-Type: application/json</code> at <code>0x3f02b2</code>.</p>
+            <div class="mt-3 grid grid-cols-2 gap-2 text-xs">
+              <div class="rounded-lg bg-slate-50 border border-slate-200 p-3"><div class="font-semibold">user_check</div><div class="text-muted">validate token + clock</div></div>
+              <div class="rounded-lg bg-slate-50 border border-slate-200 p-3"><div class="font-semibold">accounts_confirm</div><div class="text-muted">confirm account</div></div>
+              <div class="rounded-lg bg-slate-50 border border-slate-200 p-3"><div class="font-semibold">match_export / match_clear</div><div class="text-muted">history ops</div></div>
+              <div class="rounded-lg bg-slate-50 border border-slate-200 p-3"><div class="font-semibold">analytics / hacker_risk</div><div class="text-muted">telemetry</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+      <h3 class="font-semibold">Client identity</h3>
+      <p class="text-xs text-muted mt-1">Collected in <code>sub_cfdb4</code>, sent as part of envelope.</p>
+      <ul class="mt-3 text-sm space-y-2">
+        <li class="flex gap-2"><span class="w-1.5 h-1.5 rounded-full bg-accent mt-2"></span><span><b>IDFV</b> lowercased <code>UUIDString</code></span></li>
+        <li class="flex gap-2"><span class="w-1.5 h-1.5 rounded-full bg-accent mt-2"></span><span><code>[UIDevice currentDevice].name</code></span></li>
+        <li class="flex gap-2"><span class="w-1.5 h-1.5 rounded-full bg-accent mt-2"></span><span><code>sysctlbyname("hw.machine")</code> e.g. iPhone14,2</span></li>
+      </ul>
+      <div class="mt-5 rounded-xl bg-amber-50 border border-amber-200 p-3">
+        <div class="text-xs font-semibold text-amber-800">Keychain persistence</div>
+        <p class="text-xs text-amber-900/70 mt-1"><code>lynx.cloud.settings</code> / <code>lynx.cloud.accounts</code> with <code>kSecClassGenericPassword</code> — stores <code>appToken</code> + synced blobs.</p>
+      </div>
+      <div class="mt-4 rounded-xl bg-slate-50 border border-slate-200 p-3">
+        <div class="text-xs font-semibold">Key pinning</div>
+        <p class="text-xs text-muted mt-1">Client caches <code>k1:…,k2:…</code> string (65-byte <code>04||X||Y</code> EC points) and verifies server response. Replacement requires bypassing that check — not provided.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Request / Response -->
+  <section class="max-w-6xl mx-auto px-6 pb-8 grid lg:grid-cols-2 gap-6">
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+        <h3 class="font-semibold">Request it sends</h3>
+        <span class="text-xs px-2.5 py-1 rounded-full bg-slate-900 text-white">POST • JSON</span>
+      </div>
+      <div class="px-6 py-4">
+        <p class="text-xs text-muted">Serializer at <code>0xa2000-0xb2000</code>. Headers: <code>Content-Type: application/json</code>, cookies disabled.</p>
+        <pre class="mt-3 rounded-xl bg-slate-900 text-slate-100 p-4 text-xs overflow-auto leading-relaxed">{
+  "serverTime": 1717000000,
+  "appToken": "— from keychain lynx.cloud.accounts —",
+  "platform": "iOS",
+  "bundleId": "com.miniclip.8ballpoolmult",
+  "playerId": "— game player id —",
+  "locale": "en"
+}</pre>
+        <div class="mt-3 text-xs text-muted">Method derives from enum → string table at <code>0x40a0f0</code> (“GET”/“POST”). This is documentation of observed shape, not a live call.</div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+        <h3 class="font-semibold">Response when approved</h3>
+        <span class="text-xs px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">200 • JSON</span>
+      </div>
+      <div class="px-6 py-4">
+        <p class="text-xs text-muted">Deserializer parses <code>envelope, format, errorMessage, serverTime, accounts, settings</code>.</p>
+        <pre class="mt-3 rounded-xl bg-slate-900 text-slate-100 p-4 text-xs overflow-auto leading-relaxed">{
+  "envelope": "— encrypted/signed payload —",
+  "format": "1",
+  "errorMessage": null,
+  "serverTime": 1717000050,
+  "accounts": { "...": "... synced ..." },
+  "settings": { "...": "... synced ..." }
+}</pre>
+        <ul class="mt-3 text-xs text-muted list-disc list-inside space-y-1">
+          <li><code>errorMessage == null</code> → approved. UI shows <code>Active / Lifetime</code> gating.</li>
+          <li><code>serverTime</code> is authoritative and replayed next request.</li>
+          <li><code>envelope</code> authenticity is pin-checked against <code>k1/k2</code> — forging it would be a bypass.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Demo -->
+  <section class="max-w-6xl mx-auto px-6 pb-10">
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h3 class="font-semibold">Interactive playground (mock only — no real request sent)</h3>
+        <span class="text-xs px-2.5 py-1 rounded-full border border-slate-200">Offline demo</span>
+      </div>
+      <p class="text-xs text-muted mt-1">This demo builds the JSON shape locally in your browser. It does not contact <code>expert-kudu-234.convex.cloud</code> and does not attempt to forge a signed envelope.</p>
+      <div class="grid lg:grid-cols-[1.1fr_0.9fr] gap-6 mt-5">
+        <div class="space-y-3">
+          <label class="text-xs font-semibold tracking-widest uppercase text-muted">Mock request builder</label>
+          <div class="grid grid-cols-2 gap-3">
+            <input id="bundleId" value="com.miniclip.8ballpoolmult" class="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent" placeholder="bundleId" />
+            <input id="playerId" value="player_12345" class="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent" placeholder="playerId" />
+            <input id="locale" value="en" class="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent" placeholder="locale" />
+            <input id="platform" value="iOS" class="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent" placeholder="platform" />
+          </div>
+          <textarea id="req" rows="7" class="w-full rounded-xl border border-slate-200 p-3 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-accent/30"></textarea>
+          <div class="flex gap-2">
+            <button onclick="build()" class="px-4 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-black">Build request JSON</button>
+            <button onclick="mockApprove()" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-accent to-accent2 text-white text-sm font-medium">Show mock approved response</button>
+          </div>
+        </div>
+        <div class="space-y-3">
+          <label class="text-xs font-semibold tracking-widest uppercase text-muted">Mock approved response (illustrative)</label>
+          <pre id="res" class="min-h-[214px] rounded-xl bg-slate-900 text-slate-100 p-4 text-xs overflow-auto"></pre>
+          <p class="text-xs text-muted">In the real client, <code>envelope</code> would be verified against pinned <code>k1/k2</code> and <code>appToken</code> would be validated server-side. This mock envelope is random and intentionally not verifiable.</p>
+        </div>
+      </div>
+      <div class="mt-6 rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs text-muted leading-relaxed">
+        Want a legitimate project? Use this layout as a starting point for your own API docs — replace the placeholder URL with <code>https://your-own-backend.example.com</code>, implement proper authentication (e.g., JWT, OAuth), and generate your own pinned keys with secure rotation. I can help you scaffold that if you like.
+      </div>
+    </div>
+    <p class="text-center text-xs text-muted mt-4">© Educational reference • Built with Tailwind + Poppins • No vendor impersonation or bypass logic included</p>
+  </section>
+
+  <script>
+    function build(){
+      const j = {
+        serverTime: Math.floor(Date.now()/1000),
+        appToken: document.getElementById('playerId').value ? "keychain:lynx.cloud.accounts/<redacted>" : null,
+        platform: document.getElementById('platform').value || "iOS",
+        bundleId: document.getElementById('bundleId').value,
+        playerId: document.getElementById('playerId').value,
+        locale: document.getElementById('locale').value
+      };
+      document.getElementById('req').value = JSON.stringify(j, null, 2);
+      document.getElementById('res').textContent = "// click 'Show mock approved response' to see shape";
+    }
+    function mockApprove(){
+      const now = Math.floor(Date.now()/1000);
+      const mock = {
+        envelope: "MOCK_ENVELOPE_" + Math.random().toString(36).slice(2,12) + " (not signed with real k1/k2)",
+        format: "1",
+        errorMessage: null,
+        serverTime: now + 5,
+        accounts: { status: "Active", note: "mock — replace with your own backend" },
+        settings: { theme: "default" }
+      };
+      document.getElementById('res').textContent = JSON.stringify(mock, null, 2);
+    }
+    build();
+  </script>
+</body>
+</html>
