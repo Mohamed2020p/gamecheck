@@ -1,0 +1,398 @@
+================================================================================
+METHODOLOGY — HOW libloader WAS REVERSE-ENGINEERED
+================================================================================
+Scope: this file documents the ANALYSIS PROCESS ONLY — the tools, techniques,
+dead ends, and verification steps used to recover the embedded configuration
+(URL, endpoints, keys, device-linking logic) from the compiled ARM64 dylib.
+It does not describe how to modify, repoint, or bypass anything.
+
+Target: libloader (ARM64 iOS dylib, stripped, 4.7 MB)
+Result: full recovery of the obfuscated string table (~190 strings), the
+cloud/licensing protocol, and the device-linking flow. See ANALYSIS.md for
+findings; this file is the "how".
+
+--------------------------------------------------------------------------------
+0. PIPELINE OVERVIEW
+--------------------------------------------------------------------------------
+
+  triage  ->  structure  ->  relocations  ->  xref database  ->
+  locate  ->  break cipher (emulate -> port -> diff-test)  ->
+  reconstruct data flow  ->  verify & make reproducible
+
+The single most important idea in this methodology:
+
+    EMULATE FIRST, PORT SECOND, DIFF-TEST LAST.
+
+  Hand-derived reimplementations of binary crypto are almost always wrong in
+  small ways (off-by-one constants, 32/64-bit truncations, rotation
+  directions). CPU-level emulation of the original code on the mapped image
+  is ground truth. Port to Python only afterwards, then prove equivalence
+  with randomized differential testing (500/500 samples matched here).
+
+The second most important idea:
+
+    RESOLVE THE DYNAMIC LINKER'S WORK BEFORE READING ANY CODE.
+  A stripped Mach-O with chained fixups has no symbol names in .text, but
+  every external call still goes through a stub that reads a GOT entry that
+  is a *bind relocation to a symbol name*. Do that resolution yourself (or
+  via a loader) and the whole binary becomes annotated: every bl becomes
+  "call SecItemCopyMatching" or "objc_msgSend(setHTTPMethod:)".
+
+--------------------------------------------------------------------------------
+1. ENVIRONMENT & TOOLING
+--------------------------------------------------------------------------------
+
+Constraints: Debian 12 x86-64 sandbox, no macOS host (so no lldb-on-device,
+no ObjC runtime), and an egress allowlist that blocked GitHub release assets
+and Debian mirrors (so Ghidra/IDA/radare2 were NOT installable — attempts:
+apt (blocked), Temurin JDK tarball (blocked at release-assets.githubusercontent.com),
+deb.debian.org over https (TLS handshake failures)).
+
+Everything therefore came from PyPI (which was reachable) inside a venv:
+
+  pip install lief capstone angr unicorn
+
+Roles:
+
+  lief      Mach-O structure: load commands, segments/sections, imports,
+            build version, UUID. Fast first-pass triage.
+  capstone  Full ARM64 disassembly of __text (3.36 MB) with operand detail.
+  angr/CLE  The Mach-O LOADER: parsing LC_DYLD_CHAINED_FIXUPS and applying
+            all 27,312 relocations, giving true runtime values for every
+            GOT entry and __DATA pointer. Also used for exploratory
+            decompilation (mixed results — see Appendix).
+  unicorn   CPU-level ARM64 emulation of extracted functions on the mapped
+            image. Used as ground truth for the cipher and for decrypting
+            every string before the Python port existed.
+
+Custom code written during the analysis (the real workhorses):
+
+  strs.py           minimal ASCII string extractor with file offsets
+  fixups.py         (first attempt) manual chained-fixups parser
+  stub_maps.py      stub -> import / objc-stub -> selector maps
+  xrefs.py          ADRP/ADD/LDR register-tracking xref scanner
+  pdis.py           annotated pretty-disassembler (resolves stubs,
+                    selectors, and string references inline)
+  scan_strings*.py  (ptr, len, key) recovery at decryption call sites
+  emu.py            Unicorn harness: maps the image, sets registers,
+                    calls a function, reads x0 back
+  cipher.py         final verified Python port of the string cipher
+
+--------------------------------------------------------------------------------
+2. PHASE 1 — TRIAGE
+--------------------------------------------------------------------------------
+
+2.1 Identify the file
+  - Magic bytes: cf fa ed fe -> MH_MAGIC_64 little-endian; filetype 6 =
+    MH_DYLIB; cputype ARM64.
+  - lief: dump load commands. Notables: LC_ID_DYLIB install name
+    "@executable_path/Frameworks/libloader.framework/libloader" (an injected
+    framework, not an app), LC_BUILD_VERSION (iOS, minOS 14.0, SDK 26.2),
+    LC_CODE_SIGNATURE present, LC_DYLD_CHAINED_FIXUPS (modern relocations).
+  - Segment/section table: __text 3.36 MB, __const 660 KB (the encrypted
+    string table lives here), __data 295 KB, __bss 650 KB.
+
+2.2 Strings pass (before touching code)
+  - No `strings` binary available -> 12-line Python regex extractor
+    ([\x20-\x7e]{6,}) writing "offset:string" lines.
+  - Triage greps and what they revealed:
+      * ImGui FAQ URL, SVG icons, Metal/MetalKit refs -> ImGui-over-Metal UI
+      * 8 Ball Pool assets (London.png, Table_Standard_Cue.png, ball1..15)
+        and Cocos2D names (CCDirector) -> the host game
+      * NO plaintext URL, key, or endpoint anywhere -> everything sensitive
+        is obfuscated; expected an embedded encrypted string table
+      * A few plaintext JSON fragments (,"appToken":, "serverTime", etc.)
+        in __const at 0x34af60-0x34b4xx -> these are FORMAT STRINGS of a
+        hand-rolled JSON writer -> their code references became entry
+        points into the protocol layer (Phase 5).
+
+LESSON: grep the strings dump for protocol vocabulary first; even in an
+obfuscated binary, serialization format strings are often left plaintext
+because they're format fragments, not "secrets".
+
+--------------------------------------------------------------------------------
+3. PHASE 2 — STRUCTURE MAP
+--------------------------------------------------------------------------------
+
+3.1 Function boundaries without symbols
+  - The symbol table had ONLY 413 indirect/import symbols (fully stripped).
+  - LC_FUNCTION_STARTS is a ULEB128 delta-encoded list of function entry
+    offsets. Decode: read varints; each value is a delta from the previous
+    entry (first is absolute). Result: 11,931 function starts -> the size
+    map for every function (used constantly afterwards).
+
+3.2 ObjC metadata
+  - __objc_classlist (7 pointers) + classnames + methnames sections ->
+    classes: lynx_overlay_view, lynx_key_input, LynxSquircleMask,
+    MetalBuffer, MetalTexture, MetalContext, FramebufferDescriptor.
+  - Selector list (from __objc_methname) already hints the behavior:
+    URLWithString:, UUIDString, allHeaderFields, requestWithURL:,
+    setHTTPMethod:, setValue:forHTTPHeaderField:, dataTaskWithRequest:...
+
+--------------------------------------------------------------------------------
+4. PHASE 3 — RELOCATIONS: TURNING STRIPPED CODE INTO ANNOTATED CODE
+--------------------------------------------------------------------------------
+
+Why this matters: with chained fixups, every pointer in __DATA/__DATA_CONST
+and every GOT entry is stored as an encoded 64-bit value (rebase: target in
+low 36 bits + high8; bind: ordinal/addend + a next-offset chain). Until you
+decode them, you don't know what any stub calls or what any pointer
+references.
+
+4.1 First attempt — manual parser (FAILED, kept as a lesson)
+  - Wrote fixups.py parsing dyld_chained_fixups_header by hand. Header
+    field-order mistakes (I read an extra "data_size" that isn't there) and
+    a wrong symbol-name offset made import names resolve to garbage
+    (mid-string "_Se..." fragments).
+  - Diagnosis trick: hexdump the region where you THINK a structure is and
+    sanity-check field values against known facts (segCount should be ~4,
+    not 156).
+
+4.2 Second attempt — let a loader do it
+  - angr.Project(..., auto_load_libs=False) -> main_object.relocs:
+    26,648 pointer relocations + 664 symbol relocations, each with
+    dest_addr and the bound symbol name.
+  - Built got_map = {address: symbol_name}.
+
+4.3 Stub decoding (turns bl targets into names)
+  - __stubs (0x338558, 12-byte entries): pattern is
+        adrp x16, page ; ldr x16, [x16, #imm] ; br x16
+    Decode the adrp page + ldr displacement -> GOT address -> got_map ->
+    import name. 311 stubs resolved.
+  - __objc_stubs (0x339400, 32-byte entries): first adrp/ldr pair reads a
+    __objc_selref (whose pointer, after relocation application, points at
+    the selector string); last adrp/ldr/br is the objc_msgSend GOT call.
+    249 selector stubs resolved ("URLWithString:", "UUIDString", ...).
+
+RESULT: every `bl` in the binary to a stub now has a human name. This is
+what makes reading 3.36 MB of stripped ARM64 feasible at all.
+
+--------------------------------------------------------------------------------
+5. PHASE 4 — CROSS-REFERENCE DATABASE
+--------------------------------------------------------------------------------
+
+5.1 Linear disassembly with register tracking
+  - capstone over the whole __text, streaming (NOTE: materializing ~860k
+    detailed instructions at once OOM-killed the process; disassemble
+    per-function or per-window).
+  - Track a small register state machine:
+        adrp  Xn, page        -> Xn = page
+        add   Xn, Xm, #imm    -> target = page(Xm) + imm  (record data ref)
+        ldr   Xn, [Xm, #imm]  -> target = page(Xm) + imm  (record data ref)
+        any other write to a tracked register -> invalidate it
+  - Output: 14,273 distinct data targets + every call edge, keyed by
+    containing function.
+
+5.2 The classic ADRP direction bug (cost me three iterations)
+  - In program order, `adrp x1, page` PRECEDES `add x1, x1, #imm`.
+    When walking BACKWARD from a call site, you therefore meet the `add`
+    BEFORE the `adrp`. My first two scanners looked for the adrp in the
+    wrong direction (already-collected set, then forward-scan) and
+    resolved 0 call sites.
+  - Fix: while walking backward, when you hit `add xD, xN, #imm`, look at
+    the NEXT k-1, k-2, ... instructions in the backward walk (i.e., LOWER
+    addresses) for `adrp xN`.
+  - LESSON: state explicitly, per instruction pair, which direction your
+    scanner walks vs. program order. This bug produces silent zeros, not
+    exceptions.
+
+--------------------------------------------------------------------------------
+6. PHASE 5 — LOCATING THE INTERESTING CODE (two triage strategies)
+--------------------------------------------------------------------------------
+
+6.1 String-driven: who references the protocol strings?
+  - Query the xref database for the plaintext JSON fragments found in
+    Phase 1 (serverTime", ,"appToken":, ,"platform":, ,"bundleId":,
+    ,"playerId":, "envelope":, "format", errorMessage", "accounts",
+    "settings", "locale").
+  - Each resolved to exactly one function -> a serializer/deserializer
+    cluster at 0xa2000-0xb2000 = the protocol layer, and a sizeable
+    envelope-building entry at 0xa7534.
+
+6.2 Import-driven: who calls the interesting APIs?
+  - From the named call database, find callers of:
+      URLWithString: / requestWithURL: / setHTTPMethod: /
+      dataTaskWithRequest:completionHandler:      -> HTTP client 0xccf5c
+      sessionWithConfiguration:...                -> session factory 0xcd7f0
+      SecItemAdd/CopyMatching/Delete              -> keychain 0xce010/
+                                                    0xce3ac/0xce54c
+      sysctlbyname                                -> hardware ID input
+      currentDevice / identifierForVendor /
+      UUIDString / name                          -> device identity 0xcfdb4
+      dlopen / dlsym                             -> runtime resolver 0xb92e0
+      getsectiondata                             -> self-inspection
+  - Then walk the call graph UPWARD from the HTTP client:
+      callers(0xccf5c) = {0xa7534, 0xadaf0}
+      callers(0xadaf0) = {0xad36c, 0xad860} -> ... -> config/singleton
+    until you reach the object whose member at +0x30 is the URL string
+    (constructor sub_af3c4 copies a 4-string config: 0, +0x18, +0x30,
+    +0x48 — the URL being the +0x30 string).
+
+LESSON: in C++ binaries the "interesting values" are almost always struct
+members threaded through constructors; locate the constructor by its
+copy/store pattern, then find who fills it.
+
+--------------------------------------------------------------------------------
+7. PHASE 6 — IDENTIFYING AND BREAKING THE STRING CIPHER
+--------------------------------------------------------------------------------
+
+7.1 Spotting the crypto from constants
+  - Reading the device-identity function (0xcfdb4) with the annotated
+    disassembler showed:
+        adrp x1, <const blob> ; add x1, #imm        (source pointer)
+        mov x2, #imm ; movk x2, ... x4              (64-bit key constant)
+        bl  <wrapper>
+  - Following the wrapper led to a loop calling two tiny leaf functions:
+        0x4e00: madd x0, x1, GOLDEN, x0  ; b 0x4e40
+        0x4e40: x8 = z + 0x9E3779B97F4A7C15
+                x8 ^= x8>>30 ; x8 *= 0xBF58476D1CE4E5B9
+                x8 ^= x8>>27 ; x8 *= 0x94D049BB133111EB
+                x8 ^= x8>>31 ; return x8
+  - Those three magic constants are the signature of SPLITMIX64. Recognizing
+    standard PRNG/hash constants (splitmix64, xorshift, MurmurHash3
+    finalizer, xxhash, CRC tables, AES S-boxes) from memory instantly
+    classifies hand-rolled crypto.
+
+7.2 Instruction-level reading of the byte transform (0x4d98)
+    ks = keystream(key, i)                        [sub_4e00]
+    r  = ((ks>>16) & 0xffffffff - 7*((ks>>16)/7 & 0xffffffff)) mod 2^32
+         ^-- note: 64-bit udiv, then everything truncated to 32 bits
+             (the compiler's mod-7 idiom; must be replicated EXACTLY)
+    t  = (cipher_byte - ((ks>>8) as 32-bit)) mod 2^32
+    a  = (t << (r ^ 7)) mod 2^32
+    b  = ((t & 0xff) >> ((r + 1) & 7))
+    plain = ((a | b) ^ ks) & 0xff
+  - Sanity insight: (a|b) mod 256 == ror8(t & 0xff, ((r % 7)+1)) — i.e.
+    subtract a keystream byte, byte-rotate by 1..7, xor another byte.
+
+7.3 Two embedding styles -> two scanners
+  (a) WRAPPER style: ~25 small functions call sub_7bda0(dst, src, len, key)
+      with a fixed length immediate. The (src, key) come from the WRAPPER'S
+      callers, so the scanner must resolve arguments at call sites of the
+      wrappers, not at the sub_7bda0 call.
+  (b) INLINED style: the compiler inlined the whole loop into 177 consumers
+      (the loop body calls sub_4e00 directly). Scanner recognizes:
+        ldrb w?, [xSRC, xIDX]   ; mov x0, xKEY     ; bl sub_4e00
+      preceded by adrp+add (src), a mov/movk chain (key), and cmp #imm
+      (length) within the window.
+  - Both scanners share the argument-recovery logic from Phase 4/5.2.
+
+7.4 Emulation as ground truth (the decisive step)
+  - emu.py: map the raw file at vaddr==fileoff (__TEXT..__DATA), a stack,
+    a magic return address; set x0..x2; emu_start(func, magic); read x0.
+  - Calling the 11-byte blob with its key reproduced "hw.machine\0" —
+    proving the cipher reading BEFORE any Python port existed.
+  - Emulation then batch-decrypted every recovered (src, len, key) triple.
+
+7.5 Port + differential test (caught two real bugs)
+  - First Python port produced garbage. Differential testing vs emulation
+    (random key/i/byte) exposed:
+      BUG 1: my keystream did splitmix64(key + (i+1)*GOLDEN) — an extra
+             GOLDEN step. The asm computes madd(key, i, GOLDEN) then the
+             step function adds GOLDEN internally; my helper already
+             included that add. (Off-by-one in an increment.)
+      BUG 2: I computed r = (ks>>16) % 7 in 64-bit; the binary divides in
+             64-bit, truncates the quotient to 32 bits, and subtracts —
+             which differs whenever ks>>16 >= 2^32.
+  - After fixing to match instruction semantics: 500/500 random samples
+    matched emulation exactly, plus the known-plaintext check
+    ("hw.machine") and round-trips.
+
+LESSON (repeat, because it is the whole game): my first "obviously correct"
+reading was wrong twice. Emulation is cheap; silent crypto bugs are not.
+
+--------------------------------------------------------------------------------
+8. PHASE 7 — RECONSTRUCTING URL, REQUESTS, LINKING, SESSION
+--------------------------------------------------------------------------------
+
+With named calls + decrypted strings + the xref DB, the remaining work is
+patient reading of a handful of functions:
+
+  - URL: the +0x30 config string is filled by a getter (0xa7414) that
+    decrypts a 37-byte blob from __const onto the stack, constructs a
+    std::string, then zeroes the stack buffer. Blob+key+length were
+    recovered by the Phase 6 scanners -> base URL.
+  - Path building: sub_9fc5c decrypts "/link?code=" and concatenates
+    base + path + user code -> the device-linking GET.
+  - Requests: sub_a7534 builds the JSON envelope (fields visible as the
+    Phase 1 format strings), sets Content-Type: application/json
+    (plaintext pair at 0x3f02b2/0x3f02bf), and posts via the HTTP client.
+  - Device identity: 0xcfdb4 collects IDFV.UUIDString.lowercaseString +
+    [UIDevice currentDevice].name + sysctl(hw.machine) — the third being
+    an OBFUSCATED string (the 11-byte blob), which is what first proved
+    the string table mattered.
+  - Session persistence: keychain wrappers take a selector that resolves
+    to (account, service) pairs — both obfuscated strings decrypted in
+    Phase 6 ("lynx.cloud.settings" / "lynx.cloud.accounts").
+  - Key pinning: a lazily-decrypted "k1:...,k2:..." string feeds verifiers
+    that compare 64/65-byte key material from server responses. The "-_"
+    plaintext alphabet string plus 87-char base64url values decodes to
+    65-byte 0x04||X||Y uncompressed EC points.
+  - sysctl/hw.machine and every other decrypted value cross-checked
+    against what the calling code actually does with them.
+
+--------------------------------------------------------------------------------
+9. PHASE 8 — VERIFICATION & REPRODUCIBILITY
+--------------------------------------------------------------------------------
+
+  - Known-plaintext: every decrypted string must make sense at its use
+    site (sysctl name fed to sysctlbyname, service names fed to
+    kSecAttrService, paths concatenated onto the base URL).
+  - Differential testing: Python port vs Unicorn, 500 randomized samples.
+  - Round-trip: decrypt(encrypt(x)) == x for random inputs (validates the
+    internal consistency of the reading).
+  - Reproducibility: analysis/decrypt_strings.py re-derives the entire
+    corpus from the unmodified binary using only the recovered call-site
+    database (obfstrings.json / inlined_strings.json) and cipher_decrypt.py
+    (self-testing). Nothing was hand-transcribed.
+
+--------------------------------------------------------------------------------
+APPENDIX A — DEAD ENDS AND THEIR FIXES (the most instructive part)
+--------------------------------------------------------------------------------
+
+  Symptom                              Cause                              Fix
+  --------------------------------------------------------------------------------
+  Manual fixups parser produced        Misread header layout (invented a   Used a loader
+  garbage import names                 data_size field; wrong name-offset (angr/CLE) instead
+                                       base for the import strings)
+  angr decompiler returned empty       CFG built over partial regions      Switched to
+  function bodies                      without normalized graphs           annotated disasm
+                                                                         (pdis.py) for small
+                                                                         functions
+  capstone full-text scan OOM-killed   ~860k detailed insn objects         Stream/disassemble
+  the process                          materialized in a list             per-window
+  String scanners resolved 0 of 25     ADRP/ADD direction confusion in    Match the adrp at
+  call sites (twice)                   backward walks                     LOWER addresses when
+                                                                         walking backward
+  Inlined-loop scanner resolved 0      Unreachable elif arm (a later      Folded the x0-capture
+  of 287 sites                         branch shadowed by the mov/movk    into the mov handler
+                                       handler)                           branch
+  Python cipher gave garbage output    Two independent semantic bugs:      Emulate first; diff-test;
+                                       extra GOLDEN step; 64-bit % vs     replicate instruction
+                                       32-bit truncation semantics        semantics exactly
+  Ghidra/IDA/r2 unobtainable           Egress allowlist blocked release   Rebuilt equivalent
+                                       assets + apt mirrors               capability from PyPI
+                                       downloads                          (lief/capstone/angr/unicorn)
+
+APPENDIX B — TRANSFERABLE CHECKLIST
+--------------------------------------------------------------------------------
+
+  1. Parse structure (load commands, sections, function starts).
+  2. Dump strings; grep for protocol vocabulary; note what's ABSENT
+     (absence of plaintext URLs => expect an encrypted string table).
+  3. Resolve relocations/chained fixups; build GOT->symbol map; decode
+     stubs and selector stubs. Annotate every call.
+  4. Build an xref DB with ADRP/ADD/LDR register tracking (streaming).
+  5. Enter at import-driven and string-driven anchors; walk the call graph.
+  6. For embedded crypto: recognize constants; read the transform at the
+     instruction level; find ALL call-site styles (wrapper vs inlined);
+     recover (ptr, len, key) at each.
+  7. EMULATE the transform on the mapped image before porting it.
+  8. Port; differential-test vs emulation until 0 mismatches.
+  9. Cross-check every recovered value against its use site.
+ 10. Package the whole thing as a re-runnable script over the original
+     binary, so nothing depends on hand-copied values.
+
+================================================================================
+END OF METHODOLOGY
+================================================================================
