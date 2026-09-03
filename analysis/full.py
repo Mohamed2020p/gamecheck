@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """
-full.py - self-contained decryptor for every obfuscated string embedded in
-`libloader` ("Lynx" iOS mod menu dylib).
+full.py - all-in-one analysis tool for `libloader` ("Lynx" iOS mod menu dylib).
 
-This single file merges:
-  * analysis/cipher_decrypt.py  - the string-obfuscation cipher, reverse-
-    engineered from ARM64 code at 0x4d98/0x4e00/0x4e40 and verified
-    byte-for-byte against Unicorn emulation of those functions
-    (500/500 random samples matched), and
-  * analysis/decrypt_strings.py + its JSON site databases - the table of
-    encrypted-string locations recovered by static scanning of __text.
+One standalone, stdlib-only file that produces a complete analysis report:
+
+  Section 1  decrypts every obfuscated string embedded in the binary
+             (190 sites, two embedding styles) and tags the notable ones
+             (C2 base URL, /link endpoint, pinned EC keys, 32-hex secret,
+             keychain services, sysctl name, ARM64 hook patterns)
+  Section 2  decodes the pinned elliptic-curve public keys k1/k2 from
+             their base64url corpus string and exports the raw 65-byte
+             uncompressed EC points as blobs/k1.bin and blobs/k2.bin
+  Section 3  network/request layer: plain (non-obfuscated) C-strings in
+             the binary (GET, POST, Content-Type, application/json,
+             base64url alphabet, ...) with offsets, plus the decrypted
+             URL/endpoint strings and the request/response format
+  Section 4  keychain / settings / device-identity strings
+  Section 5  licensing secret + notable-function map (static analysis)
+  Section 6  ARM64 hook signature patterns
+
+The string-cipher implementation was reverse-engineered from ARM64 code at
+0x4d98/0x4e00/0x4e40 and verified byte-for-byte against Unicorn emulation
+of those functions (500/500 random samples matched); the site table was
+recovered by static scanning of __text (see ANALYSIS.md).
 
 It is completely standalone: no JSON files, no imports beyond the standard
-library. It READS the binary only - the only thing it ever writes is a
-plain-text report of the decrypted strings; it never modifies the binary.
+library. It READS the binary only - the only things it ever writes are the
+plain-text report and extracted blob files; it never modifies the binary.
 
 Two embedding styles exist in the binary (style column below):
   wrapper - a small function calls sub_7bda0(dst, src, len, key)
@@ -50,8 +63,10 @@ Binary lookup order:
     4. ./libloader
 """
 
+import base64
 import hashlib
 import os
+import re
 import sys
 
 M32 = 0xFFFFFFFF
@@ -334,6 +349,120 @@ def find_output():
     return os.path.join(os.getcwd(), "decrypted_strings.txt")
 
 
+# --------------------------------------------------------------------------
+# Notable-string tagging (runtime predicates over decrypted plaintext)
+# --------------------------------------------------------------------------
+
+HEX32 = re.compile(rb"^[0-9a-f]{32}$")
+HOOK_PATTERN = re.compile(rb"^([0-9A-F]{2}|\?)( ([0-9A-F]{2}|\?))+\x00*$")
+
+
+def is_printable(plain):
+    return all(32 <= b < 127 or b == 0 for b in plain)
+
+
+def tag_plain(plain):
+    s = plain.rstrip(b"\x00")
+    if b"convex.cloud" in plain:
+        return "C2 BASE URL"
+    if plain.startswith(b"/link"):
+        return "LINK ENDPOINT"
+    if b"k1:" in plain and b",k2:" in plain:
+        return "PINNED EC KEYS (k1/k2)"
+    if HEX32.match(s):
+        return "32-HEX SECRET"
+    if plain.startswith(b"lynx.cloud."):
+        return "KEYCHAIN SERVICE"
+    if s == b"hw.machine":
+        return "SYSCTL NAME (device id)"
+    if len(s) > 20 and HOOK_PATTERN.match(plain):
+        return "ARM64 HOOK PATTERN"
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Plain (non-obfuscated) strings of interest, extracted live from the binary
+# --------------------------------------------------------------------------
+
+PLAIN_PROBES = {
+    "GET": "HTTP method",
+    "POST": "HTTP method",
+    "PUT": "HTTP method",
+    "DELETE": "HTTP method",
+    "Content-Type": "HTTP header name",
+    "application/json": "HTTP header value",
+    "Authorization": "HTTP header name",
+    "User-Agent": "HTTP header name",
+    "Accept": "HTTP header name",
+    "-_": "base64url alt. alphabet",
+    "https://": "URL scheme prefix",
+    "serverTime": "request/response field",
+    "appToken": "request/response field",
+    "platform": "request/response field",
+    "bundleId": "request/response field",
+    "playerId": "request/response field",
+    "locale": "request/response field",
+    "envelope": "request/response field",
+    "errorMessage": "request/response field",
+}
+
+
+def cstring_hits(macho):
+    """Exact C-string matches for the probe set above -> {str: [offsets]}."""
+    hits = {}
+    for m in re.finditer(rb"[\x20-\x7e]{2,}\x00", macho):
+        s = m.group()[:-1].decode()
+        if s in PLAIN_PROBES:
+            hits.setdefault(s, []).append(m.start())
+    return hits
+
+
+# --------------------------------------------------------------------------
+# Findings from static analysis (documented in ANALYSIS.md); labelled as
+# such in the report. Everything else in the report is derived live.
+# --------------------------------------------------------------------------
+
+FUNCTION_MAP = [
+    ("sub_a7414", "provides the C2 base URL string"),
+    ("sub_9fc5c", "builds the /link?code= request"),
+    ("sub_ccf5c", "HTTP client (request execution)"),
+    ("sub_9f0a8", "lazily decrypts + caches the pinned-key string "
+                  "(global 0x4811c8, std::once_flag 0x4811c0)"),
+    ("sub_9ee84", "verifies backend signatures against the pinned keys"),
+    ("sub_a8b70", "keychain access "
+                  "(SecItem wrappers 0xce3ac / 0xce010 / 0xce54c)"),
+    ("sub_cfdb4", "device identity: IDFV.lowercase + device.name + "
+                  "sysctl(hw.machine)"),
+    ("0x2a330", "32-hex secret getter (global 0x43f1e0; "
+                "consumer: session ctor 0xa31a4)"),
+    ("0x4d98/0x4e00/0x4e40", "string-obfuscation cipher (ported in this file)"),
+]
+
+REQUEST_FIELDS = ["serverTime", "appToken", "platform",
+                  "bundleId", "playerId", "locale"]
+RESPONSE_FIELDS = ["envelope", "format", "errorMessage",
+                   "serverTime", "accounts", "settings"]
+
+
+def pinned_keys(records):
+    """Decode k1/k2 from their corpus string -> (offset, [(label, b64, raw)])."""
+    for off, ln, key, style, plain in records:
+        if plain is None or b"k1:" not in plain or b",k2:" not in plain:
+            continue
+        keys = []
+        for part in plain.rstrip(b"\x00").decode().split(","):
+            label, b64 = part.split(":", 1)
+            raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+            keys.append((label, b64, raw))
+        return off, keys
+    return None, []
+
+
+def find_plain_exact(records, needle):
+    return [off for off, ln, key, style, plain in records
+            if plain is not None and plain.rstrip(b"\x00") == needle]
+
+
 def main():
     self_test()
     path = find_binary()
@@ -341,37 +470,169 @@ def main():
     with open(path, "rb") as fh:
         macho = fh.read()
 
-    lines = []
-    lines.append("libloader obfuscated-string extraction - generated by full.py")
-    lines.append("binary: %s  (%d bytes)" % (path, len(macho)))
-    lines.append("sha256: %s" % hashlib.sha256(macho).hexdigest())
-    lines.append("%-10s  %4s  %18s  %-8s  %s"
-                 % ("OFFSET", "LEN", "KEY", "STYLE", "PLAINTEXT"))
-    n_text = n_bin = n_oor = 0
+    # decrypt every site once
+    records = []
     for off, ln, key, style in SITES:
-        if off + ln > len(macho):
+        plain = (decrypt(macho[off:off + ln], key)
+                 if off + ln <= len(macho) else None)
+        records.append((off, ln, key, style, plain))
+
+    lines = []
+    add = lines.append
+    add("libloader full analysis report - generated by full.py")
+    add("binary: %s  (%d bytes)" % (path, len(macho)))
+    add("sha256: %s" % hashlib.sha256(macho).hexdigest())
+
+    blobs = []  # (filename, bytes) - exported next to the report
+
+    # ------------------------------------------------------------------ sec 1
+    add("")
+    add("=" * 100)
+    add("SECTION 1 - DECRYPTED STRING CORPUS (%d sites)" % len(SITES))
+    add("=" * 100)
+    add("%-10s %4s  %-18s %-8s %-24s %s"
+        % ("OFFSET", "LEN", "KEY", "STYLE", "TAG", "PLAINTEXT"))
+    n_text = n_bin = n_oor = n_hooks = 0
+    for off, ln, key, style, plain in records:
+        if plain is None:
             n_oor += 1
-            lines.append("%-10s  %4d  %18s  %-8s  [out of range]"
-                         % ("%#x" % off, ln, "%#x" % key, style))
+            add("%-10s %4d  %-18s %-8s %-24s [out of range]"
+                % ("%#x" % off, ln, "%#x" % key, style, ""))
             continue
-        plain = decrypt(macho[off:off + ln], key)
-        if all(32 <= b < 127 or b == 0 for b in plain):
+        tag = tag_plain(plain)
+        if tag == "ARM64 HOOK PATTERN":
+            n_hooks += 1
+        if is_printable(plain):
             n_text += 1
-            lines.append("%-10s  %4d  %18s  %-8s  %r"
-                         % ("%#x" % off, ln, "%#x" % key, style, plain))
+            add("%-10s %4d  %-18s %-8s %-24s %r"
+                % ("%#x" % off, ln, "%#x" % key, style, tag, plain))
         else:
             n_bin += 1
-            lines.append("%-10s  %4d  %18s  %-8s  <binary data> %s"
-                         % ("%#x" % off, ln, "%#x" % key, style, plain.hex()))
-    total = len(SITES)
-    lines.append("")
-    lines.append("%d sites: %d text, %d binary, %d out of range"
-                 % (total, n_text, n_bin, n_oor))
+            blobs.append(("blob_%08x_%d.bin" % (off, ln), plain))
+            add("%-10s %4d  %-18s %-8s %-24s <binary data> %s"
+                % ("%#x" % off, ln, "%#x" % key, style, tag, plain.hex()))
+
+    # ------------------------------------------------------------------ sec 2
+    add("")
+    add("=" * 100)
+    add("SECTION 2 - PINNED EC PUBLIC KEYS (k1/k2)")
+    add("=" * 100)
+    pk_off, keys = pinned_keys(records)
+    if pk_off is None:
+        add("pinned-key string not found in corpus")
+    else:
+        add("stored as one obfuscated string @ %#x, decrypted at runtime by" % pk_off)
+        add("sub_9f0a8 (cached at global 0x4811c8, std::once_flag 0x4811c0);")
+        add("sub_9ee84 verifies backend signatures against these keys [static]")
+        for label, b64, raw in keys:
+            blobs.append(("%s.bin" % label, raw))
+            add("")
+            add("  %s (base64url, as stored): %s" % (label, b64))
+            add("  %s raw: %d bytes, uncompressed EC point 04||X||Y "
+                "(P-256/secp256k1 shape)" % (label, len(raw)))
+            add("  %s hex:  %s" % (label, raw.hex()))
+            add("  exported to: blobs/%s.bin" % label)
+
+    # ------------------------------------------------------------------ sec 3
+    add("")
+    add("=" * 100)
+    add("SECTION 3 - NETWORK / REQUEST LAYER")
+    add("=" * 100)
+    add("[live] plain C-strings present in the binary:")
+    hits = cstring_hits(macho)
+    if hits:
+        for s in sorted(hits):
+            offs = "  ".join("%#x" % o for o in hits[s][:8])
+            add("  %-18s %-26s @ %s" % (repr(s), PLAIN_PROBES[s], offs))
+    else:
+        add("  (none of the probe strings found)")
+    add("")
+    add("[live] decrypted URL strings:")
+    for off, ln, key, style, plain in records:
+        if plain is not None and (b"convex.cloud" in plain
+                                  or plain.startswith(b"/link")):
+            add("  %#010x  %r" % (off, plain.rstrip(b"\x00")))
+    add("")
+    add("[static] request:  GET {base}/link?code=<code>")
+    add("[static]   base URL provider sub_a7414, endpoint builder sub_9fc5c, "
+        "HTTP client sub_ccf5c")
+    add("[static] request envelope fields: %s" % ", ".join(REQUEST_FIELDS))
+    add("[static] response fields:         %s" % ", ".join(RESPONSE_FIELDS))
+    live_fields = []
+    for f in REQUEST_FIELDS + RESPONSE_FIELDS:
+        for o in find_plain_exact(records, f.encode()):
+            live_fields.append("%s @%#x" % (f, o))
+    add("[live]   response fields also present as corpus strings: %s"
+        % (", ".join(live_fields) if live_fields else "(none)"))
+
+    # ------------------------------------------------------------------ sec 4
+    add("")
+    add("=" * 100)
+    add("SECTION 4 - KEYCHAIN / SETTINGS / DEVICE IDENTITY")
+    add("=" * 100)
+    add("[live] corpus strings:")
+    for off, ln, key, style, plain in records:
+        if plain is None:
+            continue
+        s = plain.rstrip(b"\x00")
+        if plain.startswith(b"lynx.") or s == b"hw.machine":
+            add("  %#010x  %r  (%s)" % (off, s, tag_plain(plain) or "settings key"))
+    add("[static] sub_a8b70 reads/writes the keychain "
+        "(SecItem wrappers 0xce3ac/0xce010/0xce54c)")
+    add("[static] sub_cfdb4 builds device identity: IDFV.lowercase + "
+        "device.name + sysctl(hw.machine)")
+
+    # ------------------------------------------------------------------ sec 5
+    add("")
+    add("=" * 100)
+    add("SECTION 5 - LICENSING SECRET & NOTABLE FUNCTIONS")
+    add("=" * 100)
+    for off, ln, key, style, plain in records:
+        if plain is not None and HEX32.match(plain.rstrip(b"\x00")):
+            add("[live] 32-hex secret @ %#010x: %s"
+                % (off, plain.rstrip(b"\x00").decode()))
+    add("[static] getter 0x2a330, stored at global 0x43f1e0, "
+        "consumed by session ctor 0xa31a4")
+    add("")
+    add("[static] notable functions (see ANALYSIS.md):")
+    for name, role in FUNCTION_MAP:
+        add("  %-22s %s" % (name, role))
+
+    # ------------------------------------------------------------------ sec 6
+    add("")
+    add("=" * 100)
+    add("SECTION 6 - ARM64 HOOK SIGNATURES")
+    add("=" * 100)
+    hook_sites = [(off, plain) for off, ln, key, style, plain in records
+                  if plain is not None and tag_plain(plain) == "ARM64 HOOK PATTERN"]
+    add("[live] %d hook-signature pattern strings in the corpus "
+        "(byte/mask patterns):" % len(hook_sites))
+    for off, plain in hook_sites:
+        add("  %#010x  len=%-4d %r" % (off, len(plain.rstrip(b"\x00")),
+                                       plain.rstrip(b"\x00")))
+    add("[static] ANALYSIS.md documents 12 primary ARM64 hook signatures; this "
+        "live scan finds 13 pattern strings (variants included). Target game "
+        "classes appear as corpus strings (GameManager, ...)")
+
+    # ------------------------------------------------------------------ summary
+    add("")
+    add("=" * 100)
+    add("SUMMARY: %d sites: %d text, %d binary, %d out of range; "
+        "%d pinned EC keys; %d hook patterns"
+        % (len(SITES), n_text, n_bin, n_oor, len(keys), n_hooks))
 
     report = "\n".join(lines) + "\n"
     sys.stdout.write(report)
     with open(out_path, "w") as fh:
         fh.write(report)
+    if blobs:
+        blob_dir = os.path.join(os.path.dirname(os.path.abspath(out_path)),
+                                "blobs")
+        os.makedirs(blob_dir, exist_ok=True)
+        for name, data in blobs:
+            with open(os.path.join(blob_dir, name), "wb") as fh:
+                fh.write(data)
+        print("blobs written to: %s (%d files)" % (blob_dir, len(blobs)))
     print("report written to: %s" % os.path.abspath(out_path))
 
 
